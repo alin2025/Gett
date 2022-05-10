@@ -1,0 +1,53 @@
+'''
+Find the top 10 most frequent routes during the last 30 minutes:
+
+A route is represented by a starting grid cell and an ending grid cell.
+All routes completed within the last 30 minutes are considered for the query.
+Use a grid of 300 x 300 cells (each cell is a square of 500 x 500 m)
+'''
+
+# Get spark session instance
+spark = SparkSession \
+    .builder \
+    .appName("Kafka Pstr Project 1") \
+    .getOrCreate()
+
+lines = spark \
+  .readStream \
+  .format("kafka") \
+  .option("kafka.bootstrap.servers", "kafka:9092") \
+  .option("subscribe", "debs") \
+  .load()
+
+# Apply filters
+lines = pre_process_df(lines)
+
+# Get specified columns only
+columns = [("dropoff_datetime", "timestamp"), ("dropoff_longitude", "double"), ("dropoff_latitude", "double"),
+          ("pickup_longitude", "double"), ("pickup_latitude", "double")]
+lines = get_columns(lines, columns)
+
+# Get the cells from locations
+lines = get_areas_df(lines)
+
+# Join areas to form routes
+lines = get_routes(lines)
+
+# Count the occurrences for each route and present only the top 10 most frequent routes
+most_frequent_routes = lines.withWatermark("dropoff_datetime", "30 minutes") \
+                            .groupBy(window(lines.dropoff_datetime, "30 minutes", "10 minutes"),"route") \
+                            .count() \
+                            .orderBy("window","count",ascending=False) \
+                            .limit(10)
+
+query = most_frequent_routes \
+            .writeStream \
+            .trigger(processingTime="10 seconds") \
+            .outputMode("complete") \
+            .foreachBatch(dumpBatchDF) \
+            .start()
+
+query.awaitTermination(60)
+
+query.stop()
+spark.stop()
