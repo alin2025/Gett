@@ -1,0 +1,77 @@
+'''
+Identify areas that are currently most profitable for taxi drivers:
+
+The profitability of an area is determined by dividing the area profit by the number of dropoffs in that area within the last 15 minutes.
+The profit that originates from an area is computed by calculating the average fare + tip for trips that started in the area and ended within the last 15 minutes.
+For this problem use a cell size of 250m X 250 m, i.e., a 600 x 600 grid
+'''
+# Get spark session instance
+spark = SparkSession \
+    .builder \
+    .appName("Kafka Pstr Project 1") \
+    .getOrCreate()
+
+lines = spark \
+  .readStream \
+  .format("kafka") \
+  .option("kafka.bootstrap.servers", "kafka:9092") \
+  .option("subscribe", "debs") \
+  .load()
+
+# Apply filters
+lines = pre_process_df(lines)
+
+# Get specified columns only
+columns = [("dropoff_datetime", "timestamp"), ("pickup_datetime", "timestamp"),
+    ("pickup_longitude", "double"), ("pickup_latitude", "double"),
+    ("dropoff_longitude", "double"), ("dropoff_latitude", "double"), 
+    ("fare_amount", "float"), ("tip_amount", "float")]
+lines = get_columns(lines, columns)
+
+# Get the cells from locations
+lines = get_areas_df(lines, "smaller")
+
+# Get the profit amount
+lines = lines.withColumn("profit", lines["fare_amount"] + lines["tip_amount"]) \
+             .drop("value") 
+
+# Select only needed columns
+lines = lines.select("dropoff_datetime","pickup_datetime", "profit", "cell_pickup", "cell_dropoff")
+
+# Compute the average profit by pickup area
+profit_average = lines.groupBy(lines.cell_pickup,window(lines.dropoff_datetime,"15 minutes"))\
+                      .agg(avg(lines.profit).alias("avg_profit"))
+   
+# Compute total numbers of dropoffs
+taxis_total = lines.groupBy(lines.cell_dropoff,window(lines.dropoff_datetime,"30 minutes"))\
+                   .count()
+
+                    
+query = profit_average \
+    .writeStream \
+    .trigger(processingTime="15 seconds") \
+    .queryName("profit") \
+    .outputMode("complete") \
+    .format("memory")\
+    .start()
+
+
+query2 = taxis_total \
+    .writeStream \
+    .trigger(processingTime="15 seconds") \
+    .queryName("taxis") \
+    .outputMode("complete") \
+    .format("memory") \
+    .start()
+
+for i in range(6) :
+    spark.sql('''select profit.cell_pickup AS cell, profit.window, taxis.window, profit.avg_profit / taxis.count AS profitability 
+    from taxis join profit on 
+    taxis.cell_dropoff = profit.cell_pickup
+    ORDER BY profit.window, profitability DESC''')\
+        .show(5,False)
+    query.awaitTermination(60)
+
+query.stop()
+query2.stop()
+spark.stop()
