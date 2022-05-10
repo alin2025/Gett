@@ -1,0 +1,136 @@
+#Util Functions
+import socket
+from pyspark import SparkContext
+from pyspark.streaming import StreamingContext
+from pyspark.streaming.kafka import KafkaUtils
+from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import split, ceil, concat_ws, window, avg, sum, round
+from pyspark.sql import Row
+import math
+    
+# Longitude and latitude from the upper left corner of the grid, to help conversion
+init_long = -74.916578
+init_lat = 41.47718278
+# Longitude and latitude from the lower right boundaries for filtering purposes
+limit_long = -73.120778
+limit_lat = 40.12971598
+    
+# Used to filter the rows of the dataset. It returns a boolean value signaling if the row fills all the requirements.
+# These requirements are that it is not empty, its locations are within the city and that trip time, trip distance
+# and total amount are above 0
+def apply_filters(line):
+    # Split the line by a ,
+    splitted_line = line.split(',')
+    # Return boolean
+    return (
+        (len(line) > 0) and \
+        (float(splitted_line[6]) > init_long) and \
+        (float(splitted_line[6]) < limit_long) and \
+        (float(splitted_line[7]) > limit_lat) and \
+        (float(splitted_line[7]) < init_lat) and \
+        (float(splitted_line[8]) > init_long) and \
+        (float(splitted_line[8]) < limit_long) and \
+        (float(splitted_line[9]) > limit_lat) and \
+        (float(splitted_line[9]) < init_lat) and \
+        (float(splitted_line[5]) > 0) and \
+        (float(splitted_line[4]) > 0) and \
+        (float(splitted_line[16]) > 0)
+        )
+    
+
+# Returns every row as it was with the additional areas based on the locations
+def get_areas(line, _type = "bigger"):
+    
+    # Split the line by a ,
+    splitted_line = line.split(',')
+    line = splitted_line
+    
+    # Longitude and latitude that correspond to a shift in 500 meters
+    long_shift = 0.005986
+    lat_shift = 0.004491556
+
+    # Longitude and latitude that correspond to a shift in 250 meters
+    if _type == "smaller":
+        long_shift = long_shift / 2
+        lat_shift = lat_shift / 2
+        
+    return (
+        line[0], line[1], line[2], line[3], line[4], line[5], line[6],
+        line[7], line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15], line[16],
+        str(math.ceil((float(line[6])-init_long)/long_shift)) + "-" + str(math.ceil((init_lat-float(line[7]))/lat_shift)),
+        str(math.ceil((float(line[8])-init_long)/long_shift)) + "-" + str(math.ceil((init_lat-float(line[9]))/lat_shift))
+        )
+
+# Filters locations and some integers for dataframes
+def filter_locations_and_integers(lines):
+    split_lines = split(lines["value"], ",")
+    lines = lines.filter(split_lines.getItem(6) < limit_long) \
+        .filter(split_lines.getItem(6) > init_long) \
+        .filter(split_lines.getItem(7) < init_lat) \
+        .filter(split_lines.getItem(7) > limit_lat) \
+        .filter(split_lines.getItem(8) < limit_long) \
+        .filter(split_lines.getItem(8) > init_long) \
+        .filter(split_lines.getItem(9) < init_lat) \
+        .filter(split_lines.getItem(9) > limit_lat) \
+        .filter(split_lines.getItem(5) > 0) \
+        .filter(split_lines.getItem(4) > 0) \
+        .filter(split_lines.getItem(16) > 0)
+    return lines
+
+# Function that gets the areas from locations
+def get_areas_df(lines, _type = "bigger"):
+    
+    # Longitude and latitude that correspond to a shift in 500 meters
+    long_shift = 0.005986
+    lat_shift = 0.004491556
+
+    # Longitude and latitude that correspond to a shift in 250 meters
+    if _type == "smaller":
+        long_shift = long_shift / 2
+        lat_shift = lat_shift / 2
+        
+    split_lines = split(lines["value"], ",")
+    
+    lines = lines \
+    .withColumn("cell_pickup_longitude", ceil((split_lines.getItem(6).cast("double") - init_long) / long_shift)) \
+    .withColumn("cell_pickup_latitude", -ceil((split_lines.getItem(7).cast("double") - init_lat) / lat_shift)) \
+    .withColumn("cell_dropoff_longitude", ceil((split_lines.getItem(8).cast("double") - init_long) / long_shift)) \
+    .withColumn("cell_dropoff_latitude", -ceil((split_lines.getItem(9).cast("double") - init_lat) / lat_shift))
+    
+    lines = lines \
+        .withColumn("cell_pickup", concat_ws("-", lines["cell_pickup_latitude"], lines["cell_pickup_longitude"])) \
+        .withColumn("cell_dropoff", concat_ws("-", lines["cell_dropoff_latitude"], lines["cell_dropoff_longitude"])) \
+        .drop("cell_pickup_latitude", "cell_pickup_longitude", "cell_dropoff_latitude", "cell_dropoff_longitude")
+    
+    return lines
+
+# Gets the route from the concatenations of both cells
+def get_routes(lines):
+    lines = lines.withColumn("route", concat_ws("/", lines["cell_pickup"], lines["cell_dropoff"]))
+    return lines
+
+# Function that does basic pre processing on the data for the dataframes examples
+def pre_process_df(lines):
+    # Filter empty rows
+    lines = lines.na.drop(how="all")
+    # Filter locations outside current range or bad inputs. Also filter distance time, 
+    # time and total amounts that are less than 0.
+    lines = filter_locations_and_integers(lines)
+    return lines
+
+# Get only the specified columns
+# Columns is an array with tuples inside, the tuples got the column name and the respective type
+def get_columns(lines, columns):
+    # Array with columns for index
+    whole_columns = ["medallion", "hack_license", "pickup_datetime", "dropoff_datetime", "trip_time",
+                    "trip_distance", "pickup_longitude", "pickup_latitude", "dropoff_longitude", "dropoff_latitude",
+                    "payment_type", "fare_amount", "surcharge", "mta_tax", "tip_amount", "tolls_amount", "total_amount"]
+    split_lines = split(lines["value"], ",")
+    for column in columns:
+        lines = lines.withColumn(column[0], split_lines.getItem(whole_columns.index(column[0])).cast(column[1]))
+    
+    return lines
+    
+def dumpBatchDF(df, epoch_id):
+    df.show(20, False)
