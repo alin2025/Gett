@@ -1,0 +1,113 @@
+'''
+Detect congested areas (routes):
+
+Areas (routes) where, when the taxis enter there, the rides increase in their duration.
+For that, there should be alerts when a taxi has a peak in the duration of the ride that is followed by at least 2 rides all increasing in their duration and above area average duration for the last 4 hours.
+The alert should contain the location where the taxi started the ride which had the peak duration.
+'''
+
+# Update function that persists through time the information of the number of rides that rise sequentially in
+# duration for all routes
+# Example of newValues (120.0, '-73.989525', '40.741528')
+# This updateState does not need artificial window because it already resets values in it's nature
+def updateFunction(newValues, runningObj):
+    if runningObj is None:
+        runningObj = (newValues[0][0], 0, 0, newValues[0][1], newValues[0][2], newValues[0][0])
+    for v in newValues:
+        # counter - counts the number of sequential rides
+        counter = runningObj[1]
+        # prev_dur - previous rows duration
+        prev_dur = runningObj[0]
+        # dur - target's row duration
+        dur = v[0]
+        # long - target's row long
+        long = runningObj[2]
+        # lat - target's row lat
+        lat = runningObj[3]
+        # first_dur - first ride's duration of the sequence of rides
+        first_dur = runningObj[4]
+
+        # if current duration is inferior to the previous one, reset counter
+        if dur <= prev_dur:
+            counter = 0
+        else: counter += 1
+
+        # if reset happens, also reset some variables to persist from first ride
+        if counter == 0:
+            long = v[1]
+            lat = v[2]
+            first_dur = v[0]
+
+        runningObj = (dur, counter, long, lat, first_dur)
+    return runningObj
+
+# Update function that gets the count of duration per route
+# Example of newValues (120.0, pickup_datetime, dropoff_datetime)
+# Also has an artificial window that resets computations when 4 hours have passed
+def updateFunctionMean(newValues, runningCount):
+    if runningCount is None:
+        runningCount = (0.0, 0.0, newValues[0][1], newValues[0][2])
+    for v in newValues:
+
+        runningCount = (v[0] + runningCount[0], runningCount[1]+1, runningCount[2], v[2])
+
+        if datetime.strptime(v[2], "%Y-%m-%d %H:%M:%S") - datetime.strptime(runningCount[2], "%Y-%m-%d %H:%M:%S") > timedelta(hours=4):
+            runningCount = (v[0], 1, v[1], v[2])
+
+    return runningCount
+
+# Creating the spark context and streaming context objects
+sc = SparkContext("local[2]", "KafkaExample")
+ssc = StreamingContext(sc, 5)
+ssc.checkpoint('checkpoint')
+lines = KafkaUtils.createDirectStream(ssc, ["debs"], \
+            {"metadata.broker.list": "kafka:9092"})
+
+try:
+    
+    # Kafka sends a timestamp followed by the actual value of the row, so keep the second value in the tuple
+    filtered_lines = lines.map(lambda line: line[1])
+    # Apply filters
+    filtered_lines = filtered_lines.filter(lambda line: apply_filters(line))
+    # Get areas
+    lines_areas = filtered_lines.map(lambda line: get_areas(line))
+
+    # Get desired columns only
+    desired_columns = lines_areas.map(lambda line: (str(line[17]) + ":" + str(line[18]), (float(line[4]), line[6], line[7])))
+
+    # Get rows with number of rising rides through the beginning
+    counters = desired_columns.updateStateByKey(updateFunction)
+
+    # Only get the rows that had a sequential ride number equal or above to 2
+    # Example: ('315-325:379-372', (560.0, 1, 0, '-73.97625', '40.748528', 234,1))
+    counters_filtered = counters.filter(lambda line: line[1][1] >= 2)
+
+    # Get desired columns for mean computation
+    desired_columns_means = lines_areas.map(lambda line: (str(line[17]) + ":" + str(line[18]), (float(line[4]), line[2], line[3])))
+
+    # Get the mean of duration per route
+    means = desired_columns_means.updateStateByKey(updateFunctionMean) \
+            .map(lambda line: (line[0], float(line[1][0]) / float(line[1][1]), line[1][2], line[1][3]))
+
+    # Joins the two above together and flattens, took summed duration
+    joined = counters_filtered.join(means) \
+            .map(lambda line: (line[0], line[1][0][1], line[1][0][2], line[1][0][3], line[1][0][4], line[1][1]))
+
+    # Per position meanings: (area, nr_rides, first_long, first_lat, first_dur, area_mean_dur)
+    # Filter out rows that have a first ride duration equal or less than the mean of the same route
+    peak_filter = joined.filter(lambda line: float(line[4]) > float(line[5]))
+    
+    # Get only useful information to show
+    peak_filter = peak_filter.map(lambda line: (line[0], line[1], line[2], line[3]))
+
+    peak_filter.pprint()
+
+    ssc.start()
+    ssc.awaitTermination(60)
+    ssc.stop()
+    sc.stop()
+
+except Exception as e:
+    print(e)
+    ssc.stop()
+    sc.stop()
