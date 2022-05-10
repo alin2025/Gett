@@ -1,0 +1,49 @@
+'''
+Select the most pleasant taxi drivers:
+
+To distinguish the most pleasant taxi driver in one day, it should be shown the taxi driver with the highest percentage of tips in that day.
+'''
+
+# Get spark session instance
+spark = SparkSession \
+    .builder \
+    .appName("Kafka Pstr Project 1") \
+    .getOrCreate()
+
+lines = spark \
+  .readStream \
+  .format("kafka") \
+  .option("kafka.bootstrap.servers", "kafka:9092") \
+  .option("subscribe", "debs") \
+  .load()
+
+# Apply filters
+lines = pre_process_df(lines)
+
+# Get specified columns only
+columns = [("dropoff_datetime", "timestamp"), ("hack_license", "string"), ("tip_amount", "double"), 
+          ("total_amount", "double")]
+lines = get_columns(lines, columns)
+
+# Get tip percentage
+lines = lines.withColumn("tip_percentage", lines["tip_amount"]/lines["total_amount"]) \
+    .drop("value","key","topic","partition","offset","timestamp","timestampType")
+
+# For each taxi driver, compute the average tip percentage and show only the taxi driver with the highest value
+# for this average
+avg_tip_percentage = lines.groupBy(window("dropoff_datetime","1 days"),"hack_license") \
+                          .avg("tip_percentage") \
+                          .orderBy('avg(tip_percentage)',ascending=False) \
+                          .limit(1)
+
+query = avg_tip_percentage \
+            .writeStream \
+            .outputMode("complete") \
+            .trigger(processingTime="60 seconds") \
+            .foreachBatch(dumpBatchDF) \
+            .start()
+
+query.awaitTermination(60)
+
+query.stop()
+spark.stop()
